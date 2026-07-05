@@ -230,3 +230,82 @@ stays, translated on read.
 | `ConferenceUnpublished` | Conference Mgmt / Registration read models | |
 | `SeatCreated` | Conference Mgmt / SeatsAvailability handler, read models | Becomes `AddSeats` on the inventory |
 | `SeatUpdated` | Conference Mgmt / SeatsAvailability handler, read models | Quota/price changes flow into inventory |
+
+## 5. If this ran on Kafka
+
+The original runs on Azure Service Bus (topics/subscriptions) with SQL for process-manager state
+and the event store. Translating it to Kafka is mostly straightforward — and the places where it
+is *not* straightforward are the instructive ones.
+
+### Topics & keys
+
+| Topic | Key | Rationale |
+|---|---|---|
+| `registration.order-events` | `OrderId` | All order lifecycle events for one order stay ordered in one partition |
+| `registration.seats-availability-events` | `ConferenceId` | Seat inventory is per-conference contended state; single-writer ordering per conference |
+| `payments.events` | payment `SourceId` (payload carries `OrderId` for correlation) | Payments BC owns its own key space; PM correlates by `OrderId` field |
+| `conference.integration-events` | `ConferenceId` | CRUD-side changes projected into Registration read models |
+
+The principle behind every row: **choose the key so that every event the state machine must
+observe in order lands in one partition** — Kafka orders per partition, never across topics.
+
+### The process manager as a consumer
+
+The PM becomes one consumer-group service subscribed to the order, seats-availability, and
+payments topics, with its state row in a database keyed by the correlation ID (here, `OrderId`).
+The crucial thing Kafka does *not* give you is any ordering across those three topics:
+`PaymentCompleted` can be consumed before the `SeatsReserved` that logically precedes it. But
+look back at the transition table — the shipped PM already survives this. The correlation-ID
+filter drops stale responses, row 5 makes re-delivery a no-op, row 7 accepts `OrderConfirmed`
+from two states, and row 9 shrugs off a stale expiration. The Journey's hardening chapter is,
+in effect, a checklist of what any Kafka consumer must do anyway.
+
+### The delayed-command gap
+
+Service Bus provides scheduled delivery (`ExpireRegistrationProcess`, delayed 29 minutes) and
+per-message TTL (`MakeSeatReservation`, window + 1 minute) natively. Kafka has neither. Options:
+
+1. **Kafka Streams punctuator** over a state store of pending expirations — clean if the PM is
+   already a Streams application, otherwise it drags in the whole Streams runtime for a timer.
+2. **Delay topic + paused consumer** — a consumer that pauses partitions until the head message
+   matures. Works, but fights rebalances and `max.poll.interval.ms` forever.
+3. **External scheduler / DB polling** — a periodic query for `ReservationAutoExpiration < now()`.
+
+Recommendation: **DB polling**. The PM's state already lives in a DB row that stores
+`ReservationAutoExpiration`; polling that table is boring, transactional with the state it
+guards, and closest to what the shipped design actually relies on. The TTL side translates the
+same way: a reservation command is simply ignored if it arrives after the row says the window
+closed — the guard moves from the transport into the handler.
+
+### Delivery guarantees
+
+The Journey's stance is at-least-once transport plus idempotent handlers plus manual de-dup —
+correlation IDs, the `ExpirationCommandId` check, and EF optimistic concurrency. Kafka's
+exactly-once semantics do not make that machinery obsolete: transactions cover
+consume-process-produce **within Kafka only**. The PM's state write is a SQL `UPDATE` outside
+any Kafka transaction, so the pair "update DB row + publish command" can still tear. Which means
+the same two tools carry over: handler idempotence for the consume side, and the
+[outbox pattern](./outbox-pattern.md) for the publish side — the command is written to an outbox
+table in the same DB transaction as the state change, and relayed to Kafka afterwards. See also
+the broader notes on [delivery guarantees](./reliability-and-at-most-once.md).
+
+## 6. Lessons the Journey team recorded
+
+- **The PM's persistence model bothered them.** The doubt is committed into the source (§3's
+  quote): current-state-row persistence made reprocessing and auditing the flow harder than the
+  event-sourced aggregates around it.
+- **Public contracts are forever.** `OrderPaymentConfirmed` → `OrderConfirmed` looks like a
+  rename; in an event store it is a migration, a translation handler, and a type that can never
+  be deleted.
+- **Eventual consistency leaks into the UI.** After `RegisterToConference`, the public site polls
+  the read model until the order materializes — a "please wait" loop. The asynchrony you buy on
+  the backend must be paid for somewhere in the UX.
+- **Hardening ate the schedule.** The late journey chapters are almost entirely de-duplication,
+  retries, idempotency, and message-ordering defenses — infrastructure, not domain logic.
+
+The same line drawn in the [food-delivery assignment](./assignment.md) shows up here unchanged:
+payment stayed a synchronous request/response there, and here `InitiateThirdPartyProcessorPayment`
+is a synchronous redirect out to the processor — only the *outcome* (`PaymentCompleted`) re-enters
+the system as an event. Seat holds, confirmations, expirations, projections: asynchronous and
+event-driven. The moment money moves or contended inventory must be answered *now*: synchronous.
+Two very different domains, same judgment.
