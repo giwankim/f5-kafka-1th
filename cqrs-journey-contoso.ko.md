@@ -3,9 +3,6 @@
 > 마이크로소프트 **CQRS Journey** 샘플(2012, V3 코드)의 이벤트와 이벤트 처리 상태 머신을 정리한
 > 학습 문서로, 아카이브된 소스 `microsoftarchive/cqrs-journey`를 기준으로 검증했다.
 > 이 문서는 영문 원본 [English](./cqrs-journey-contoso.md)의 한국어 번역본이다.
->
-> 왜 이 시스템인가: *Designing Data-Intensive Applications* (2판) 3장("Event Sourcing and CQRS")이
-> 가리키는 설계 스타일의 정석적인 실전 예제가 바로 CQRS Journey다 — 시행착오까지 포함해서.
 
 ## 1. 왜 이 시스템인가, 그리고 그 구조
 
