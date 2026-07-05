@@ -120,3 +120,113 @@ just evaporates. If the process completed meanwhile, the expire command's ID no 
 `OrderConfirmed` arrives, so a payment squeezed in at the very end of the window can still lose
 to the expiration — the 14-minute buffer exists to make that window practically irrelevant, not
 impossible.
+
+## 3. The two coordinated aggregates
+
+**`Order`** (event-sourced) is the registrant's side of the story: what was requested, what it
+costs, and whether it survived. It emits the order lifecycle events — `OrderPlaced`,
+`OrderUpdated`, `OrderTotalsCalculated`, `OrderPartiallyReserved`, `OrderReservationCompleted`,
+`OrderExpired`, `OrderConfirmed` — and is driven by the commands `RegisterToConference`,
+`MarkSeatsAsReserved`, `ConfirmOrder`, and `RejectOrder`. Note the split of perspective: the
+*process manager* decides that a reservation succeeded, but it is the *order* that records
+`OrderReservationCompleted` about itself when told via `MarkSeatsAsReserved`.
+
+**`SeatsAvailability`** (event-sourced, one instance per conference) is the inventory ledger. It
+answers exactly one question — how many seats of each type remain — and emits `SeatsReserved`,
+`SeatsReservationCommitted`, `SeatsReservationCancelled`, and `AvailableSeatsChanged` in response
+to `MakeSeatReservation`, `CommitSeatReservation`, `CancelSeatReservation`, `AddSeats`, and
+`RemoveSeats`. It is the contended aggregate: every order for a conference funnels through the
+same instance, which is why reservation is a two-phase hold/commit rather than a single decrement.
+
+Neither aggregate references the other. `Order` never touches inventory; `SeatsAvailability`
+never sees registrants. Each remains a small consistency boundary that can be loaded, mutated,
+and stored atomically — and the price of that isolation is the `RegistrationProcessManager`:
+the flow logic has to live in a third place, with its own persistence and its own failure modes.
+The team themselves were not sure they drew this line right; this comment sits in the middle of
+the process manager's state properties (`RegistrationProcessManager.cs:67-68`):
+
+> "feels awkward and possibly disrupting to store these properties here. Would it be better if
+> instead of using current state values, we use event sourcing?"
+
+## 4. Event & command catalog
+
+Two kinds of contracts matter here. **Public contracts** (`Registration.Contracts`,
+`Payments.Contracts`, `Conference.Contracts`) cross bounded-context boundaries and are versioned
+carefully. **BC-internal events** (`Registration/Events`) never leave the Orders & Registrations
+context, so they can change freely without coordinating with anyone.
+
+### 4.1 Order aggregate events (public, `Registration.Contracts/Events`)
+
+| Name | Emitted by / Handled by | Notes |
+|---|---|---|
+| `OrderPlaced` | Order / PM, read models | Starts the saga; carries seats + `ReservationAutoExpiration` |
+| `OrderUpdated` | Order / PM, read models | Registrant edited seats; PM re-reserves |
+| `OrderPartiallyReserved` | Order / read models | Only some requested seats could be held |
+| `OrderReservationCompleted` | Order / read models | All requested seats held |
+| `OrderExpired` | Order / read models | Order rejected after the hold lapsed |
+| `OrderConfirmed` | Order / PM, SeatAssignments handler, read models | Terminal success; also triggers seat-assignment creation |
+| `OrderPaymentConfirmed` | — (deprecated) / migration handler | Replaced by `OrderConfirmed`; kept for deserialization of old stored events |
+| `OrderRegistrantAssigned` | Order / read models | Registrant contact details attached |
+| `OrderTotalsCalculated` | Order / read models | Pricing computed server-side |
+
+The `OrderPaymentConfirmed` row is the sample's event-versioning war story in one line: renaming a
+public event is easy in code and unpayable in a store full of serialized history — so the old type
+stays, translated on read.
+
+### 4.2 SeatAssignments aggregate events (public, `Registration.Contracts/Events`)
+
+| Name | Emitted by / Handled by | Notes |
+|---|---|---|
+| `SeatAssignmentsCreated` | SeatAssignments / read models | Created from a confirmed order |
+| `SeatAssigned` | SeatAssignments / read models | Attendee attached to a seat |
+| `SeatUnassigned` | SeatAssignments / read models | Attendee removed |
+| `SeatAssignmentUpdated` | SeatAssignments / read models | Attendee details changed |
+
+### 4.3 SeatsAvailability events (BC-internal, `Registration/Events`)
+
+| Name | Emitted by / Handled by | Notes |
+|---|---|---|
+| `SeatsReserved` | SeatsAvailability / PM, read models | The hold; carries actual reserved counts (may differ from requested) |
+| `SeatsReservationCommitted` | SeatsAvailability / read models | Hold made permanent |
+| `SeatsReservationCancelled` | SeatsAvailability / read models | Hold released back to inventory |
+| `AvailableSeatsChanged` | SeatsAvailability / read models | Inventory delta for projections |
+
+### 4.4 Registration commands (`Registration/Commands`)
+
+| Name | Sent by → Handled by | Notes |
+|---|---|---|
+| `RegisterToConference` | Public site → Order | Creates the order |
+| `AssignRegistrantDetails` | Public site → Order | Contact details |
+| `MakeSeatReservation` | PM → SeatsAvailability | Sent with TTL = window + 1 min |
+| `MarkSeatsAsReserved` | PM → Order | Tells the order its hold succeeded |
+| `CommitSeatReservation` | PM → SeatsAvailability | On confirmation |
+| `CancelSeatReservation` | PM → SeatsAvailability | On expiration |
+| `ConfirmOrder` | PM (after payment) or public site (zero-cost) → Order | Two senders, one meaning |
+| `RejectOrder` | PM → Order | On expiration or dead-on-arrival orders |
+| `ExpireRegistrationProcess` | PM → itself | Delayed 29 min; ignored if stale |
+| `AssignSeat` / `UnassignSeat` | Public site → SeatAssignments | Post-purchase attendee management |
+| `AddSeats` / `RemoveSeats` | Conference Mgmt integration → SeatsAvailability | Organizer changed seat quotas |
+
+### 4.5 Payments BC (`Payments.Contracts`)
+
+| Name | Kind | Notes |
+|---|---|---|
+| `PaymentInitiated` | event | Registrant sent to the third-party processor |
+| `PaymentCompleted` | event | The one the PM subscribes to |
+| `PaymentRejected` | event | Processor declined; order left to expire |
+| `PaymentAccepted` | event | **Defined but never published** in the sample's main flow |
+| `InitiateThirdPartyProcessorPayment` | command | Public site → Payments |
+| `CompleteThirdPartyProcessorPayment` | command | Return-URL callback → Payments |
+| `CancelThirdPartyProcessorPayment` | command | Registrant backed out |
+| `InitiateInvoicePayment` | command | Invoice path; present in contracts, not exercised by the sample UI |
+
+### 4.6 Conference Management integration events (`Conference.Contracts`)
+
+| Name | Emitted by / Handled by | Notes |
+|---|---|---|
+| `ConferenceCreated` | Conference Mgmt / Registration read models | CRUD side publishes after saving |
+| `ConferenceUpdated` | Conference Mgmt / Registration read models | |
+| `ConferencePublished` | Conference Mgmt / Registration read models | Conference visible to the public site |
+| `ConferenceUnpublished` | Conference Mgmt / Registration read models | |
+| `SeatCreated` | Conference Mgmt / SeatsAvailability handler, read models | Becomes `AddSeats` on the inventory |
+| `SeatUpdated` | Conference Mgmt / SeatsAvailability handler, read models | Quota/price changes flow into inventory |
