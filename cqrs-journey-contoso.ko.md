@@ -195,7 +195,7 @@ ID는 더 이상 `ExpirationCommandId`와 일치하지 않으므로 무시된다
 |---|---|---|
 | `RegisterToConference` | 공개 사이트 → Order | 주문 생성 |
 | `AssignRegistrantDetails` | 공개 사이트 → Order | 연락처 정보 |
-| `MakeSeatReservation` | PM → SeatsAvailability | TTL = 윈도우 + 1분로 전송 |
+| `MakeSeatReservation` | PM → SeatsAvailability | TTL = 윈도우 + 1분으로 전송 |
 | `MarkSeatsAsReserved` | PM → Order | 선점 성공을 주문에 통보 |
 | `CommitSeatReservation` | PM → SeatsAvailability | 확정 시 |
 | `CancelSeatReservation` | PM → SeatsAvailability | 만료 시 |
